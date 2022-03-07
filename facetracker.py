@@ -4,6 +4,10 @@ import sys
 import argparse
 import traceback
 import gc
+import mediapipe as mp
+mp_hands = mp.solutions.hands
+# mp_drawing = mp.solutions.drawing_utils
+# mp_drawing_styles = mp.solutions.drawing_styles
 
 parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 parser.add_argument("-i", "--ip", help="Set IP address for sending tracking data", default="127.0.0.1")
@@ -47,6 +51,9 @@ parser.add_argument("--face-id-offset", type=int, help="When set, this offset is
 parser.add_argument("--repeat-video", type=int, help="When set to 1 and a video file was specified with -c, the tracker will loop the video until interrupted", default=0)
 parser.add_argument("--dump-points", type=str, help="When set to a filename, the current face 3D points are made symmetric and dumped to the given file when quitting the visualization with the \"q\" key", default="")
 parser.add_argument("--benchmark", type=int, help="When set to 1, the different tracking models are benchmarked, starting with the best and ending with the fastest and with gaze tracking disabled for models with negative IDs", default=0)
+parser.add_argument("--frame-data", type=int, help="When set to 1, the server is sending webcam frame data", default=0)
+parser.add_argument("--webcam-preview", type=int, help="When set to 1, the server is pop ups webcam preview window", default=0)
+
 if os.name == 'nt':
     parser.add_argument("--use-dshowcapture", type=int, help="When set to 1, libdshowcapture will be used for video input instead of OpenCV", default=1)
     parser.add_argument("--blackmagic-options", type=str, help="When set, this additional option string is passed to the blackmagic capture library", default=None)
@@ -122,6 +129,8 @@ if os.name == 'nt' and (args.list_cameras > 0 or not args.list_dcaps is None):
     cap.destroy_capture()
     sys.exit(0)
 
+import math
+import pickle
 import numpy as np
 import time
 import cv2
@@ -130,6 +139,9 @@ import struct
 import json
 from input_reader import InputReader, VideoReader, DShowCaptureReader, try_int
 from tracker import Tracker, get_model_base_path
+import pyvirtualcam
+from pyvirtualcam import PixelFormat
+
 
 if args.benchmark > 0:
     model_base_path = get_model_base_path(args.model_dir)
@@ -146,6 +158,8 @@ if args.benchmark > 0:
             total += time.perf_counter() - start
         print(1. / (total / 100.))
     sys.exit(0)
+
+max_length = 65535
 
 target_ip = args.ip
 target_port = args.port
@@ -205,250 +219,336 @@ try:
     need_reinit = 0
     failures = 0
     source_name = input_reader.name
-    while repeat or input_reader.is_open():
-        if not input_reader.is_open() or need_reinit == 1:
-            input_reader = InputReader(args.capture, args.raw_rgb, args.width, args.height, fps, use_dshowcapture=use_dshowcapture_flag, dcap=dcap)
-            if input_reader.name != source_name:
-                print(f"Failed to reinitialize camera and got {input_reader.name} instead of {source_name}.")
-                sys.exit(1)
-            need_reinit = 2
-            time.sleep(0.02)
-            continue
-        if not input_reader.is_ready():
-            time.sleep(0.02)
-            continue
-
-        ret, frame = input_reader.read()
-        if ret and args.mirror_input:
-            frame = cv2.flip(frame, 1)
-        if not ret:
-            if repeat:
-                if need_reinit == 0:
-                    need_reinit = 1
+    with mp_hands.Hands(min_detection_confidence=0.5,min_tracking_confidence=0.5) as holistic, \
+    pyvirtualcam.Camera(args.width, args.height, fps, fmt=PixelFormat.BGR, print_fps=fps) as cam:
+        while repeat or input_reader.is_open(): 
+            if not input_reader.is_open() or need_reinit == 1:
+                input_reader = InputReader(args.capture, args.raw_rgb, args.width, args.height, fps, use_dshowcapture=use_dshowcapture_flag, dcap=dcap)
+                if input_reader.name != source_name:
+                    print(f"Failed to reinitialize camera and got {input_reader.name} instead of {source_name}.")
+                    sys.exit(1)
+                need_reinit = 2
+                time.sleep(0.02)
                 continue
-            elif is_camera:
-                attempt += 1
-                if attempt > 30:
-                    break
-                else:
-                    time.sleep(0.02)
-                    if attempt == 3:
+            if not input_reader.is_ready():
+                time.sleep(0.02)
+                continue
+
+            ret, frame = input_reader.read()
+            if ret and args.mirror_input:
+                frame = cv2.flip(frame, 1)
+            if not ret:
+                if repeat:
+                    if need_reinit == 0:
                         need_reinit = 1
                     continue
-            else:
-                break;
-
-        attempt = 0
-        need_reinit = 0
-        frame_count += 1
-        now = time.time()
-
-        if first:
-            first = False
-            height, width, channels = frame.shape
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            tracker = Tracker(width, height, threshold=args.threshold, max_threads=args.max_threads, max_faces=args.faces, discard_after=args.discard_after, scan_every=args.scan_every, silent=False if args.silent == 0 else True, model_type=args.model, model_dir=args.model_dir, no_gaze=False if args.gaze_tracking != 0 and args.model != -1 else True, detection_threshold=args.detection_threshold, use_retinaface=args.scan_retinaface, max_feature_updates=args.max_feature_updates, static_model=True if args.no_3d_adapt == 1 else False, try_hard=args.try_hard == 1)
-            if not args.video_out is None:
-                out = cv2.VideoWriter(args.video_out, cv2.VideoWriter_fourcc('F','F','V','1'), args.video_fps, (width * args.video_scale, height * args.video_scale))
-
-        try:
-            inference_start = time.perf_counter()
-            faces = tracker.predict(frame)
-            if len(faces) > 0:
-                inference_time = (time.perf_counter() - inference_start)
-                total_tracking_time += inference_time
-                tracking_time += inference_time / len(faces)
-                tracking_frames += 1
-            packet = bytearray()
-            detected = False
-            for face_num, f in enumerate(faces):
-                f = copy.copy(f)
-                f.id += args.face_id_offset
-                if f.eye_blink is None:
-                    f.eye_blink = [1, 1]
-                right_state = "O" if f.eye_blink[0] > 0.30 else "-"
-                left_state = "O" if f.eye_blink[1] > 0.30 else "-"
-                if args.silent == 0:
-                    print(f"Confidence[{f.id}]: {f.conf:.4f} / 3D fitting error: {f.pnp_error:.4f} / Eyes: {left_state}, {right_state}")
-                detected = True
-                if not f.success:
-                    pts_3d = np.zeros((70, 3), np.float32)
-                packet.extend(bytearray(struct.pack("d", now)))
-                packet.extend(bytearray(struct.pack("i", f.id)))
-                packet.extend(bytearray(struct.pack("f", width)))
-                packet.extend(bytearray(struct.pack("f", height)))
-                packet.extend(bytearray(struct.pack("f", f.eye_blink[0])))
-                packet.extend(bytearray(struct.pack("f", f.eye_blink[1])))
-                packet.extend(bytearray(struct.pack("B", 1 if f.success else 0)))
-                packet.extend(bytearray(struct.pack("f", f.pnp_error)))
-                packet.extend(bytearray(struct.pack("f", f.quaternion[0])))
-                packet.extend(bytearray(struct.pack("f", f.quaternion[1])))
-                packet.extend(bytearray(struct.pack("f", f.quaternion[2])))
-                packet.extend(bytearray(struct.pack("f", f.quaternion[3])))
-                packet.extend(bytearray(struct.pack("f", f.euler[0])))
-                packet.extend(bytearray(struct.pack("f", f.euler[1])))
-                packet.extend(bytearray(struct.pack("f", f.euler[2])))
-                packet.extend(bytearray(struct.pack("f", f.translation[0])))
-                packet.extend(bytearray(struct.pack("f", f.translation[1])))
-                packet.extend(bytearray(struct.pack("f", f.translation[2])))
-                if not log is None:
-                    log.write(f"{frame_count},{now},{width},{height},{fps},{face_num},{f.id},{f.eye_blink[0]},{f.eye_blink[1]},{f.conf},{f.success},{f.pnp_error},{f.quaternion[0]},{f.quaternion[1]},{f.quaternion[2]},{f.quaternion[3]},{f.euler[0]},{f.euler[1]},{f.euler[2]},{f.rotation[0]},{f.rotation[1]},{f.rotation[2]},{f.translation[0]},{f.translation[1]},{f.translation[2]}")
-                for (x,y,c) in f.lms:
-                    packet.extend(bytearray(struct.pack("f", c)))
-                if args.visualize > 1:
-                    frame = cv2.putText(frame, str(f.id), (int(f.bbox[0]), int(f.bbox[1])), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255,0,255))
-                if args.visualize > 2:
-                    frame = cv2.putText(frame, f"{f.conf:.4f}", (int(f.bbox[0] + 18), int(f.bbox[1] - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255))
-                for pt_num, (x,y,c) in enumerate(f.lms):
-                    packet.extend(bytearray(struct.pack("f", y)))
-                    packet.extend(bytearray(struct.pack("f", x)))
-                    if not log is None:
-                        log.write(f",{y},{x},{c}")
-                    if pt_num == 66 and (f.eye_blink[0] < 0.30 or c < 0.20):
-                        continue
-                    if pt_num == 67 and (f.eye_blink[1] < 0.30 or c < 0.20):
-                        continue
-                    x = int(x + 0.5)
-                    y = int(y + 0.5)
-                    if args.visualize != 0 or not out is None:
-                        if args.visualize > 3:
-                            frame = cv2.putText(frame, str(pt_num), (int(y), int(x)), cv2.FONT_HERSHEY_SIMPLEX, 0.25, (255,255,0))
-                        color = (0, 255, 0)
-                        if pt_num >= 66:
-                            color = (255, 255, 0)
-                        if not (x < 0 or y < 0 or x >= height or y >= width):
-                            frame[int(x), int(y)] = color
-                        x += 1
-                        if not (x < 0 or y < 0 or x >= height or y >= width):
-                            frame[int(x), int(y)] = color
-                        y += 1
-                        if not (x < 0 or y < 0 or x >= height or y >= width):
-                            frame[int(x), int(y)] = color
-                        x -= 1
-                        if not (x < 0 or y < 0 or x >= height or y >= width):
-                            frame[int(x), int(y)] = color
-                if args.pnp_points != 0 and (args.visualize != 0 or not out is None) and f.rotation is not None:
-                    if args.pnp_points > 1:
-                        projected = cv2.projectPoints(f.face_3d[0:66], f.rotation, f.translation, tracker.camera, tracker.dist_coeffs)
+                elif is_camera:
+                    attempt += 1
+                    if attempt > 30:
+                        break
                     else:
-                        projected = cv2.projectPoints(f.contour, f.rotation, f.translation, tracker.camera, tracker.dist_coeffs)
-                    for [(x,y)] in projected[0]:
+                        time.sleep(0.02)
+                        if attempt == 3:
+                            need_reinit = 1
+                        continue
+                else:
+                    break;
+
+            attempt = 0
+            need_reinit = 0
+            frame_count += 1
+            now = time.time()
+
+            if first:
+                first = False
+                height, width, channels = frame.shape
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                tracker = Tracker(width, height, threshold=args.threshold, max_threads=args.max_threads, max_faces=args.faces, discard_after=args.discard_after, scan_every=args.scan_every, silent=False if args.silent == 0 else True, model_type=args.model, model_dir=args.model_dir, no_gaze=False if args.gaze_tracking != 0 and args.model != -1 else True, detection_threshold=args.detection_threshold, use_retinaface=args.scan_retinaface, max_feature_updates=args.max_feature_updates, static_model=True if args.no_3d_adapt == 1 else False, try_hard=args.try_hard == 1)
+                if not args.video_out is None:
+                    out = cv2.VideoWriter(args.video_out, cv2.VideoWriter_fourcc('F','F','V','1'), args.video_fps, (width * args.video_scale, height * args.video_scale))
+
+            if args.webcam_preview == 1:
+                cam.send(frame)
+                cam.sleep_until_next_frame()
+
+            try:
+                inference_start = time.perf_counter()
+                faces = tracker.predict(frame)
+                if len(faces) > 0:
+                    inference_time = (time.perf_counter() - inference_start)
+                    total_tracking_time += inference_time
+                    tracking_time += inference_time / len(faces)
+                    tracking_frames += 1
+                packet = bytearray()
+                detected = False
+                for face_num, f in enumerate(faces):
+                    f = copy.copy(f)
+                    f.id += args.face_id_offset
+                    if f.eye_blink is None:
+                        f.eye_blink = [1, 1]
+                    right_state = "O" if f.eye_blink[0] > 0.30 else "-"
+                    left_state = "O" if f.eye_blink[1] > 0.30 else "-"
+                    if args.silent == 0:
+                        print(f"Confidence[{f.id}]: {f.conf:.4f} / 3D fitting error: {f.pnp_error:.4f} / Eyes: {left_state}, {right_state}")
+                    detected = True
+                    if not f.success:
+                        pts_3d = np.zeros((70, 3), np.float32)
+                    packet.extend(bytearray(struct.pack("d", now)))
+                    packet.extend(bytearray(struct.pack("i", f.id)))
+                    packet.extend(bytearray(struct.pack("f", width)))
+                    packet.extend(bytearray(struct.pack("f", height)))
+                    packet.extend(bytearray(struct.pack("f", f.eye_blink[0])))
+                    packet.extend(bytearray(struct.pack("f", f.eye_blink[1])))
+                    packet.extend(bytearray(struct.pack("B", 1 if f.success else 0)))
+                    packet.extend(bytearray(struct.pack("f", f.pnp_error)))
+                    packet.extend(bytearray(struct.pack("f", f.quaternion[0])))
+                    packet.extend(bytearray(struct.pack("f", f.quaternion[1])))
+                    packet.extend(bytearray(struct.pack("f", f.quaternion[2])))
+                    packet.extend(bytearray(struct.pack("f", f.quaternion[3])))
+                    packet.extend(bytearray(struct.pack("f", f.euler[0])))
+                    packet.extend(bytearray(struct.pack("f", f.euler[1])))
+                    packet.extend(bytearray(struct.pack("f", f.euler[2])))
+                    packet.extend(bytearray(struct.pack("f", f.translation[0])))
+                    packet.extend(bytearray(struct.pack("f", f.translation[1])))
+                    packet.extend(bytearray(struct.pack("f", f.translation[2])))
+                    if not log is None:
+                        log.write(f"{frame_count},{now},{width},{height},{fps},{face_num},{f.id},{f.eye_blink[0]},{f.eye_blink[1]},{f.conf},{f.success},{f.pnp_error},{f.quaternion[0]},{f.quaternion[1]},{f.quaternion[2]},{f.quaternion[3]},{f.euler[0]},{f.euler[1]},{f.euler[2]},{f.rotation[0]},{f.rotation[1]},{f.rotation[2]},{f.translation[0]},{f.translation[1]},{f.translation[2]}")
+                    for (x,y,c) in f.lms:
+                        packet.extend(bytearray(struct.pack("f", c)))
+                    if args.visualize > 1:
+                        frame = cv2.putText(frame, str(f.id), (int(f.bbox[0]), int(f.bbox[1])), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255,0,255))
+                    if args.visualize > 2:
+                        frame = cv2.putText(frame, f"{f.conf:.4f}", (int(f.bbox[0] + 18), int(f.bbox[1] - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255))
+                    for pt_num, (x,y,c) in enumerate(f.lms):
+                        packet.extend(bytearray(struct.pack("f", y)))
+                        packet.extend(bytearray(struct.pack("f", x)))
+                        if not log is None:
+                            log.write(f",{y},{x},{c}")
+                        if pt_num == 66 and (f.eye_blink[0] < 0.30 or c < 0.20):
+                            continue
+                        if pt_num == 67 and (f.eye_blink[1] < 0.30 or c < 0.20):
+                            continue
                         x = int(x + 0.5)
                         y = int(y + 0.5)
-                        if not (x < 0 or y < 0 or x >= height or y >= width):
-                            frame[int(x), int(y)] = (0, 255, 255)
-                        x += 1
-                        if not (x < 0 or y < 0 or x >= height or y >= width):
-                            frame[int(x), int(y)] = (0, 255, 255)
-                        y += 1
-                        if not (x < 0 or y < 0 or x >= height or y >= width):
-                            frame[int(x), int(y)] = (0, 255, 255)
-                        x -= 1
-                        if not (x < 0 or y < 0 or x >= height or y >= width):
-                            frame[int(x), int(y)] = (0, 255, 255)
-                for (x,y,z) in f.pts_3d:
-                    packet.extend(bytearray(struct.pack("f", x)))
-                    packet.extend(bytearray(struct.pack("f", -y)))
-                    packet.extend(bytearray(struct.pack("f", -z)))
+                        if args.visualize != 0 or not out is None:
+                            if args.visualize > 3:
+                                frame = cv2.putText(frame, str(pt_num), (int(y), int(x)), cv2.FONT_HERSHEY_SIMPLEX, 0.25, (255,255,0))
+                            color = (0, 255, 0)
+                            if pt_num >= 66:
+                                color = (255, 255, 0)
+                            if not (x < 0 or y < 0 or x >= height or y >= width):
+                                frame[int(x), int(y)] = color
+                            x += 1
+                            if not (x < 0 or y < 0 or x >= height or y >= width):
+                                frame[int(x), int(y)] = color
+                            y += 1
+                            if not (x < 0 or y < 0 or x >= height or y >= width):
+                                frame[int(x), int(y)] = color
+                            x -= 1
+                            if not (x < 0 or y < 0 or x >= height or y >= width):
+                                frame[int(x), int(y)] = color
+                    if args.pnp_points != 0 and (args.visualize != 0 or not out is None) and f.rotation is not None:
+                        if args.pnp_points > 1:
+                            projected = cv2.projectPoints(f.face_3d[0:66], f.rotation, f.translation, tracker.camera, tracker.dist_coeffs)
+                        else:
+                            projected = cv2.projectPoints(f.contour, f.rotation, f.translation, tracker.camera, tracker.dist_coeffs)
+                        for [(x,y)] in projected[0]:
+                            x = int(x + 0.5)
+                            y = int(y + 0.5)
+                            if not (x < 0 or y < 0 or x >= height or y >= width):
+                                frame[int(x), int(y)] = (0, 255, 255)
+                            x += 1
+                            if not (x < 0 or y < 0 or x >= height or y >= width):
+                                frame[int(x), int(y)] = (0, 255, 255)
+                            y += 1
+                            if not (x < 0 or y < 0 or x >= height or y >= width):
+                                frame[int(x), int(y)] = (0, 255, 255)
+                            x -= 1
+                            if not (x < 0 or y < 0 or x >= height or y >= width):
+                                frame[int(x), int(y)] = (0, 255, 255)
+                    for (x,y,z) in f.pts_3d:
+                        packet.extend(bytearray(struct.pack("f", x)))
+                        packet.extend(bytearray(struct.pack("f", -y)))
+                        packet.extend(bytearray(struct.pack("f", -z)))
+                        if not log is None:
+                            log.write(f",{x},{-y},{-z}")
+                    if f.current_features is None:
+                        f.current_features = {}
+                    for feature in features:
+                        if not feature in f.current_features:
+                            f.current_features[feature] = 0
+                        packet.extend(bytearray(struct.pack("f", f.current_features[feature])))
+                        if not log is None:
+                            log.write(f",{f.current_features[feature]}")
                     if not log is None:
-                        log.write(f",{x},{-y},{-z}")
-                if f.current_features is None:
-                    f.current_features = {}
-                for feature in features:
-                    if not feature in f.current_features:
-                        f.current_features[feature] = 0
-                    packet.extend(bytearray(struct.pack("f", f.current_features[feature])))
-                    if not log is None:
-                        log.write(f",{f.current_features[feature]}")
-                if not log is None:
-                    log.write("\r\n")
-                    log.flush()
+                        log.write("\r\n")
+                        log.flush()
 
-            if detected and len(faces) < 40:
-                sock.sendto(packet, (target_ip, target_port))
+                # -- DETECT HANDS -----------------------------
+                frame.flags.writeable = False
+                # frame = cv2.flip(frame, 1)
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                results = holistic.process(frame)
 
-            if not out is None:
-                video_frame = frame
-                if args.video_scale != 1:
-                    video_frame = cv2.resize(frame, (width * args.video_scale, height * args.video_scale), interpolation=cv2.INTER_NEAREST)
-                out.write(video_frame)
-                if args.video_scale != 1:
-                    del video_frame
+                frame.flags.writeable = True
+                frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                # ---------------------------------------------
 
-            if args.visualize != 0:
-                cv2.imshow('OpenSeeFace Visualization', frame)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    if args.dump_points != "" and not faces is None and len(faces) > 0:
-                        np.set_printoptions(threshold=sys.maxsize, precision=15)
-                        pairs = [
-                            (0, 16),
-                            (1, 15),
-                            (2, 14),
-                            (3, 13),
-                            (4, 12),
-                            (5, 11),
-                            (6, 10),
-                            (7, 9),
-                            (17, 26),
-                            (18, 25),
-                            (19, 24),
-                            (20, 23),
-                            (21, 22),
-                            (31, 35),
-                            (32, 34),
-                            (36, 45),
-                            (37, 44),
-                            (38, 43),
-                            (39, 42),
-                            (40, 47),
-                            (41, 46),
-                            (48, 52),
-                            (49, 51),
-                            (56, 54),
-                            (57, 53),
-                            (58, 62),
-                            (59, 61),
-                            (65, 63)
-                        ]
-                        points = copy.copy(faces[0].face_3d)
-                        for a, b in pairs:
-                            x = (points[a, 0] - points[b, 0]) / 2.0
-                            y = (points[a, 1] + points[b, 1]) / 2.0
-                            z = (points[a, 2] + points[b, 2]) / 2.0
-                            points[a, 0] = x
-                            points[b, 0] = -x
-                            points[[a, b], 1] = y
-                            points[[a, b], 2] = z
-                        points[[8, 27, 28, 29, 33, 50, 55, 60, 64], 0] = 0.0
-                        points[30, :] = 0.0
-                        with open(args.dump_points, "w") as fh:
-                            fh.write(repr(points))
+
+                
+                # hands_count = 0 if not results.multi_handedness else len(results.multi_handedness)
+                # packet.extend(bytearray(struct.pack("i", hands_count)))
+                handposition = [[[0] * 3 for i in range(4)] for i in range(2)] # 4 vector3 for 2 hands
+                if results.multi_handedness:                    
+                    for i, handedness in enumerate(results.multi_handedness):
+                        hand_landmarks = results.multi_hand_landmarks[i]
+                        # hand_world_landmarks = results.multi_hand_world_landmarks[i]
+                        jointIndices = [0,1,5,9]
+                        poses = [hand_landmarks.landmark[i] for i in jointIndices] # wrist, index, middle joints 
+                        # world_poses = [hand_world_landmarks.landmark[i] for i in jointIndices] # wrist, index, middle joints 
+
+                        hand_info = handedness.classification[0]
+                        hand_index = hand_info.index
+
+                        for jointIndex, pose in enumerate(poses):
+                            handposition[hand_index][jointIndex][0] = float(pose.x)                    
+                            handposition[hand_index][jointIndex][1] = float(pose.y)                
+                            handposition[hand_index][jointIndex][2] = float(pose.z)              
+
+                        wrist = poses[0]
+                        middle = poses[3]
+                        x = (middle.x + wrist.x)/2 * width
+                        y = (middle.y + wrist.y)/2.2 * height
+                        frame = cv2.circle(frame,(int(x), int(y)), 20, (0,255,0), 2)
+
+                for hand in handposition:
+                    for joint in hand:
+                        for axis in joint:
+                            packet.extend(bytearray(struct.pack("f", axis)))
+
+                if detected and len(faces) < 40:
+                    sock.sendto(packet, (target_ip, target_port))
+                else:
+                    sock.sendto(struct.pack("B", 0), (target_ip, target_port))
+
+
+                if args.frame_data == 1:
+                    retval, buffer = cv2.imencode(".jpg", frame)
+                    if retval:
+                        # convert to byte array
+                        buffer = buffer.tobytes()
+                        # get size of the frame
+                        buffer_size = len(buffer)
+
+                        num_of_packs = 1
+                        if buffer_size > max_length:
+                            num_of_packs = math.ceil(buffer_size/max_length)
+
+                        # frame_info = {"packs":num_of_packs}
+                        frame_info = bytearray(struct.pack("i", num_of_packs))
+
+                        # send the number of packs to be expected
+                        # print("Number of packs:", num_of_packs)
+                        sock.sendto(frame_info, (target_ip, target_port))
+                        
+                        left = 0
+                        right = max_length
+
+                        for i in range(num_of_packs):
+                            # print("left:", left)
+                            # print("right:", right)
+
+                            # truncate data to send
+                            data = buffer[left:right]
+                            left = right
+                            right += max_length
+
+                            # send the frames accordingly
+                            sock.sendto(data, (target_ip, target_port))
+
+                if not out is None:
+                    video_frame = frame
+                    if args.video_scale != 1:
+                        video_frame = cv2.resize(frame, (width * args.video_scale, height * args.video_scale), interpolation=cv2.INTER_NEAREST)
+                    out.write(video_frame)
+                    if args.video_scale != 1:
+                        del video_frame
+
+
+                if args.visualize > 1 and args.frame_data == 0:
+                    cv2.imshow('OpenSeeFace Visualization', frame)
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        if args.dump_points != "" and not faces is None and len(faces) > 0:
+                            np.set_printoptions(threshold=sys.maxsize, precision=15)
+                            pairs = [
+                                (0, 16),
+                                (1, 15),
+                                (2, 14),
+                                (3, 13),
+                                (4, 12),
+                                (5, 11),
+                                (6, 10),
+                                (7, 9),
+                                (17, 26),
+                                (18, 25),
+                                (19, 24),
+                                (20, 23),
+                                (21, 22),
+                                (31, 35),
+                                (32, 34),
+                                (36, 45),
+                                (37, 44),
+                                (38, 43),
+                                (39, 42),
+                                (40, 47),
+                                (41, 46),
+                                (48, 52),
+                                (49, 51),
+                                (56, 54),
+                                (57, 53),
+                                (58, 62),
+                                (59, 61),
+                                (65, 63)
+                            ]
+                            points = copy.copy(faces[0].face_3d)
+                            for a, b in pairs:
+                                x = (points[a, 0] - points[b, 0]) / 2.0
+                                y = (points[a, 1] + points[b, 1]) / 2.0
+                                z = (points[a, 2] + points[b, 2]) / 2.0
+                                points[a, 0] = x
+                                points[b, 0] = -x
+                                points[[a, b], 1] = y
+                                points[[a, b], 2] = z
+                            points[[8, 27, 28, 29, 33, 50, 55, 60, 64], 0] = 0.0
+                            points[30, :] = 0.0
+                            with open(args.dump_points, "w") as fh:
+                                fh.write(repr(points))
+                        break
+                failures = 0
+            except Exception as e:
+                if e.__class__ == KeyboardInterrupt:
+                    if args.silent == 0:
+                        print("Quitting")
                     break
-            failures = 0
-        except Exception as e:
-            if e.__class__ == KeyboardInterrupt:
-                if args.silent == 0:
-                    print("Quitting")
-                break
-            traceback.print_exc()
-            failures += 1
-            if failures > 30:
-                break
+                traceback.print_exc()
+                failures += 1
+                if failures > 30:
+                    break
 
-        collected = False
-        del frame
+            collected = False
+            del frame
 
-        duration = time.perf_counter() - frame_time
-        while duration < target_duration:
-            if not collected:
-                gc.collect()
-                collected = True
             duration = time.perf_counter() - frame_time
-            sleep_time = target_duration - duration
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-            duration = time.perf_counter() - frame_time
-        frame_time = time.perf_counter()
+            while duration < target_duration:
+                if not collected:
+                    gc.collect()
+                    collected = True
+                duration = time.perf_counter() - frame_time
+                sleep_time = target_duration - duration
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                duration = time.perf_counter() - frame_time
+            frame_time = time.perf_counter()
 except KeyboardInterrupt:
     if args.silent == 0:
         print("Quitting")

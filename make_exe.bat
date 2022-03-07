@@ -11,6 +11,6 @@ pyinstaller facetracker.spec --onedir ^
     --add-binary vccorlib140.dll;. ^
     --add-binary run.bat;.
 
-del dist\facetracker\cv2\opencv_videoio_ffmpeg420_64.dll
+del dist\facetracker\cv2\opencv_ffmpeg400_64.dll
 
 pause
