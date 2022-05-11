@@ -5,7 +5,9 @@ import argparse
 import traceback
 import gc
 import mediapipe as mp
+import pickle
 mp_hands = mp.solutions.hands
+
 # mp_drawing = mp.solutions.drawing_utils
 # mp_drawing_styles = mp.solutions.drawing_styles
 
@@ -31,6 +33,7 @@ parser.add_argument("-d", "--detection-threshold", type=float, help="Set minimum
 parser.add_argument("-v", "--visualize", type=int, help="Set this to 1 to visualize the tracking, to 2 to also show face ids, to 3 to add confidence values or to 4 to add numbers to the point display", default=0)
 parser.add_argument("-P", "--pnp-points", type=int, help="Set this to 1 to add the 3D fitting points to the visualization", default=0)
 parser.add_argument("-s", "--silent", type=int, help="Set this to 1 to prevent text output on the console", default=0)
+parser.add_argument("-r", "--max-resolution", type=int, help="Set maximum resolution", default=-1)
 parser.add_argument("--faces", type=int, help="Set the maximum number of faces (slow)", default=1)
 parser.add_argument("--scan-retinaface", type=int, help="When set to 1, scanning for additional faces will be performed using RetinaFace in a background thread, otherwise a simpler, faster face detection mechanism is used. When the maximum number of faces is 1, this option does nothing.", default=0)
 parser.add_argument("--scan-every", type=int, help="Set after how many frames a scan for new faces should run", default=3)
@@ -44,6 +47,7 @@ parser.add_argument("--video-fps", type=float, help="This sets the frame rate of
 parser.add_argument("--raw-rgb", type=int, help="When this is set, raw RGB frames of the size given with \"-W\" and \"-H\" are read from standard input instead of reading a video", default=0)
 parser.add_argument("--log-data", help="You can set a filename to which tracking data will be logged here", default="")
 parser.add_argument("--log-output", help="You can set a filename to console output will be logged here", default="")
+parser.add_argument("--calibrate-output", help="You can set a filename to console output will be logged here", default="")
 parser.add_argument("--model", type=int, help="This can be used to select the tracking model. Higher numbers are models with better tracking quality, but slower speed, except for model 4, which is wink optimized. Models 1 and 0 tend to be too rigid for expression and blink detection. Model -2 is roughly equivalent to model 1, but faster. Model -3 is between models 0 and -1.", default=3, choices=[-3, -2, -1, 0, 1, 2, 3, 4])
 parser.add_argument("--model-dir", help="This can be used to specify the path to the directory containing the .onnx model files", default=None)
 parser.add_argument("--gaze-tracking", type=int, help="When set to 1, gaze tracking is enabled, which makes things slightly slower", default=1)
@@ -159,7 +163,9 @@ if args.benchmark > 0:
         print(1. / (total / 100.))
     sys.exit(0)
 
-max_length = 65535
+max_length = 65000
+height = 0
+width = 0
 
 target_ip = args.ip
 target_port = args.port
@@ -172,20 +178,30 @@ dcap = None
 use_dshowcapture_flag = False
 if os.name == 'nt':
     dcap = args.dcap
+    if args.max_resolution > 0:
+        unit = 10000000.
+        cap = dshowcapture.DShowCapture()
+        res = cap.get_info()[int(args.capture)]['caps'] #get camera resolutions
+        best_res = max(res , key=lambda x: x['maxCX'] * unit/x['minInterval'] if unit/x['minInterval'] >= fps and x['maxCX'] <= args.max_resolution else -1)
+        dcap = best_res['id']
+        width = best_res['maxCX']
+        height = best_res['maxCY']
+
     use_dshowcapture_flag = True if args.use_dshowcapture == 1 else False
     input_reader = InputReader(args.capture, args.raw_rgb, args.width, args.height, fps, use_dshowcapture=use_dshowcapture_flag, dcap=dcap)
     if args.dcap == -1 and type(input_reader) == DShowCaptureReader:
         fps = min(fps, input_reader.device.get_fps())
 else:
     input_reader = InputReader(args.capture, args.raw_rgb, args.width, args.height, fps)
+    width = args.width
+    height = args.height
+    
 if type(input_reader.reader) == VideoReader:
     fps = 0
 
 log = None
 out = None
 first = True
-height = 0
-width = 0
 tracker = None
 sock = None
 total_tracking_time = 0.0
@@ -220,7 +236,7 @@ try:
     failures = 0
     source_name = input_reader.name
     with mp_hands.Hands(min_detection_confidence=0.5,min_tracking_confidence=0.5) as holistic, \
-    pyvirtualcam.Camera(args.width, args.height, fps, fmt=PixelFormat.BGR, print_fps=fps) as cam:
+    pyvirtualcam.Camera(width, height, fps, fmt=PixelFormat.BGR, print_fps=fps) as cam:
         while repeat or input_reader.is_open(): 
             if not input_reader.is_open() or need_reinit == 1:
                 input_reader = InputReader(args.capture, args.raw_rgb, args.width, args.height, fps, use_dshowcapture=use_dshowcapture_flag, dcap=dcap)
@@ -266,7 +282,10 @@ try:
                 tracker = Tracker(width, height, threshold=args.threshold, max_threads=args.max_threads, max_faces=args.faces, discard_after=args.discard_after, scan_every=args.scan_every, silent=False if args.silent == 0 else True, model_type=args.model, model_dir=args.model_dir, no_gaze=False if args.gaze_tracking != 0 and args.model != -1 else True, detection_threshold=args.detection_threshold, use_retinaface=args.scan_retinaface, max_feature_updates=args.max_feature_updates, static_model=True if args.no_3d_adapt == 1 else False, try_hard=args.try_hard == 1)
                 if not args.video_out is None:
                     out = cv2.VideoWriter(args.video_out, cv2.VideoWriter_fourcc('F','F','V','1'), args.video_fps, (width * args.video_scale, height * args.video_scale))
-
+                if args.calibrate_output != "" and os.path.isfile(args.calibrate_output):
+                    with open(args.calibrate_output, 'rb') as dbfile: 
+                        db = pickle.load(dbfile)
+                        tracker.face_info[0].features = db
             if args.webcam_preview == 1:
                 cam.send(frame)
                 cam.sleep_until_next_frame()
@@ -334,19 +353,22 @@ try:
                             if args.visualize > 3:
                                 frame = cv2.putText(frame, str(pt_num), (int(y), int(x)), cv2.FONT_HERSHEY_SIMPLEX, 0.25, (255,255,0))
                             color = (0, 255, 0)
+                            dot_size = int(width/500)
                             if pt_num >= 66:
                                 color = (255, 255, 0)
+                                # dot_size = int(width/200)
+                                # frame = cv2.putText(frame, f"{c:.4f}", (int(y), int(x)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,0))
                             if not (x < 0 or y < 0 or x >= height or y >= width):
-                                frame[int(x), int(y)] = color
+                                frame = cv2.circle(frame,(int(y), int(x)), dot_size, color, -1)
                             x += 1
                             if not (x < 0 or y < 0 or x >= height or y >= width):
-                                frame[int(x), int(y)] = color
+                                frame = cv2.circle(frame,(int(y), int(x)), dot_size, color, -1)
                             y += 1
                             if not (x < 0 or y < 0 or x >= height or y >= width):
-                                frame[int(x), int(y)] = color
+                                frame = cv2.circle(frame,(int(y), int(x)), dot_size, color, -1)
                             x -= 1
                             if not (x < 0 or y < 0 or x >= height or y >= width):
-                                frame[int(x), int(y)] = color
+                                frame = cv2.circle(frame,(int(y), int(x)), dot_size, color, -1)
                     if args.pnp_points != 0 and (args.visualize != 0 or not out is None) and f.rotation is not None:
                         if args.pnp_points > 1:
                             projected = cv2.projectPoints(f.face_3d[0:66], f.rotation, f.translation, tracker.camera, tracker.dist_coeffs)
@@ -419,7 +441,7 @@ try:
                         middle = poses[3]
                         x = (middle.x + wrist.x)/2 * width
                         y = (middle.y + wrist.y)/2.2 * height
-                        frame = cv2.circle(frame,(int(x), int(y)), 20, (0,255,0), 2)
+                        frame = cv2.circle(frame,(int(x), int(y)), int(width/50), (0,255,0), 2)
 
                 for hand in handposition:
                     for joint in hand:
@@ -433,6 +455,7 @@ try:
 
 
                 if args.frame_data == 1:
+                    # frame = frame if width < 720 else cv2.resize(frame, (720, 480), interpolation=cv2.INTER_NEAREST)
                     retval, buffer = cv2.imencode(".jpg", frame)
                     if retval:
                         # convert to byte array
@@ -562,3 +585,11 @@ if args.silent == 0 and tracking_frames > 0:
     average_tracking_time = 1000 * tracking_time / tracking_frames
     print(f"Average tracking time per detected face: {average_tracking_time:.2f} ms")
     print(f"Tracking time: {total_tracking_time:.3f} s\nFrames: {tracking_frames}")
+
+
+if args.calibrate_output != "" and len(tracker.face_info) > 0:
+    db = tracker.face_info[0].features
+    with open(args.calibrate_output, 'ab') as dbfile: 
+        dbfile = open(args.calibrate_output, 'ab')
+        # source, destination
+        pickle.dump(db, dbfile)                     
