@@ -2,7 +2,7 @@
 
 # Overview
 
-**Note**: This is a tracking library, **not** a stand-alone avatar puppeteering program. I'm also working on [VSeeFace](https://www.vseeface.icu/), which allows animating [VRM](https://vrm.dev/en/how_to_make_vrm/) and [VSFAvatar](https://www.youtube.com/watch?v=jhQ8DF87I5I) 3D models by using OpenSeeFace tracking. [VTube Studio](https://denchisoft.com/) uses OpenSeeFace for webcam based tracking to animate Live2D models. A renderer for the Godot engine can be found [here](https://github.com/you-win/openseeface-gd).
+**Note**: This is a tracking library, **not** a stand-alone avatar puppeteering program. I'm also working on [VSeeFace](https://www.vseeface.icu/), which allows animating [VRM](https://vrm.dev/en/how_to_make_vrm/) and [VSFAvatar](https://www.youtube.com/watch?v=jhQ8DF87I5I) 3D models by using OpenSeeFace tracking. [VTube Studio](https://denchisoft.com/) uses OpenSeeFace for webcam based tracking to animate Live2D models. A renderer for the Godot engine can be found [here](https://github.com/virtual-puppet-project/vpuppr).
 
 This project implements a facial landmark detection model based on MobileNetV3.
 
@@ -11,6 +11,14 @@ As Pytorch 1.3 CPU inference speed on Windows is very low, the model was convert
 If anyone is curious, the name is a silly pun on the open seas and seeing faces. There's no deeper meaning.
 
 An up to date sample video can be found [here](https://www.youtube.com/watch?v=AaNap_ud_3I&vq=hd1080), showing the default tracking model's performance under different noise and light levels.
+
+# Tracking quality
+
+Since the landmarks used by OpenSeeFace are a bit different from those used by other approaches (they are close to iBUG 68, with two less points in the mouth corners and quasi-3D face contours instead of face contours that follow the visible outline) it is hard to numerically compare its accuracy to that of other approaches found commonly in scientific literature. The tracking performance is also more optimized for making landmarks that are useful for animating an avatar than for exactly fitting the face image. For example, as long as the eye landmarks show whether the eyes are opened or closed, even if their location is somewhat off, they can still be useful for this purpose.
+
+From general observation, OpenSeeFace performs well in adverse conditions (low light, high noise, low resolution) and keeps tracking faces through a very wide range of head poses with relatively high stability of landmark positions. Compared to MediaPipe, OpenSeeFace landmarks remain more stable in challenging conditions and it accurately represents a wider range of mouth poses. However, tracking of the eye region can be less accurate.
+
+I ran OpenSeeFace on a sample clip from the video presentation for [3D Face Reconstruction with Dense Landmarks](https://microsoft.github.io/DenseLandmarks/) by Wood et al. to compare it to MediaPipe and their approach. You can watch the result [here](https://cdn.discordapp.com/attachments/720652345540870237/1016320201807106118/OSFMediaPipe3DFR.mp4).
 
 # Usage
 
@@ -93,7 +101,7 @@ Four pretrained face landmark models are included. Using the `--model` switch, i
 
 FPS measurements are from running on one core of my CPU.
 
-Pytorch weights for use with `model.py` can be found [here](https://mega.nz/file/vvYXlYQT#h7FpEg4tmOCJNxjpsDEw0JomJIkVGKwrt4OUV0RNDDU).
+Pytorch weights for use with `model.py` can be found [here](https://mega.nz/file/vvYXlYQT#h7FpEg4tmOCJNxjpsDEw0JomJIkVGKwrt4OUV0RNDDU). Some unoptimized ONNX models can be found [here](https://github.com/emilianavt/OpenSeeFace/issues/48).
 
 # Results
 
@@ -121,9 +129,8 @@ When distributing it, you should also distribute the `Licenses` folder along wit
 
 The release builds contain a custom build of ONNX Runtime without telemetry.
 
-# Dependencies
+# Dependencies (Python 3.6 - 3.9)
 
-* Python 3.7
 * ONNX Runtime
 * OpenCV
 * Pillow
@@ -138,6 +145,16 @@ install all dependencies for this project in a separate virtual env:
 
      poetry install
 
+# Dependencies (Python 3.10 and above)
+
+* ort-nightly
+* OpenCV
+* Pillow
+* Numpy
+
+The required libraries can be installed using pip:
+ 
+	pip install ort-nightly opencv-python pillow numpy
 
 # References
 
