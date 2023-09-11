@@ -11,7 +11,7 @@ call venv\Scripts\activate.bat
 echo "Installing dependencies"
 pip install wheel
 
-pip install onnxruntime opencv-python==4.5.4.60 pillow numpy==1.23.0 pyinstaller
+pip install onnxruntime opencv-python==4.5.4.60 pillow numpy==1.23.0 pyinstaller mediapipe=0.10.2
 
 echo "Running pyinstaller"
 pyinstaller facetracker.py --clean ^
@@ -19,11 +19,16 @@ pyinstaller facetracker.py --clean ^
     --add-binary dshowcapture/*.dll;. ^
     --add-binary escapi/*.dll;. ^
     --add-binary venv/lib/site-packages/onnxruntime/capi/*.dll;onnxruntime\capi ^
+    --add-binary venv/lib/site-packages/mediapipe/python/*.dll;mediapipe\python ^
     --add-binary msvcp140.dll;. ^
     --add-binary vcomp140.dll;. ^
     --add-binary concrt140.dll;. ^
     --add-binary vccorlib140.dll;. ^
-    --add-binary run.bat;.
+    --add-binary run.bat;. ^
+    --add-data "mediapipe/modules/hand_landmark;." ^
+    --add-data "mediapipe/modules/hand_landmark;." ^
+    --add-data "mediapipe/modules/palm_detection;." ^
+    --add-data "mediapipe/modules/palm_detection;."
 
 echo "Deleting opencv dll"
 del dist\facetracker\cv2\opencv_videoio_*

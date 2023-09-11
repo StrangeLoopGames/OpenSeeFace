@@ -5,7 +5,6 @@ import argparse
 import traceback
 import gc
 import mediapipe as mp
-import pickle
 mp_hands = mp.solutions.hands
 
 # mp_drawing = mp.solutions.drawing_utils
@@ -55,7 +54,6 @@ parser.add_argument("--repeat-video", type=int, help="When set to 1 and a video 
 parser.add_argument("--dump-points", type=str, help="When set to a filename, the current face 3D points are made symmetric and dumped to the given file when quitting the visualization with the \"q\" key", default="")
 parser.add_argument("--benchmark", type=int, help="When set to 1, the different tracking models are benchmarked, starting with the best and ending with the fastest and with gaze tracking disabled for models with negative IDs", default=0)
 parser.add_argument("--frame-data", type=int, help="When set to 1, the server is sending webcam frame data", default=0)
-parser.add_argument("--webcam-preview", type=int, help="When set to 1, the server is pop ups webcam preview window", default=0)
 
 if os.name == 'nt':
     parser.add_argument("--use-dshowcapture", type=int, help="When set to 1, libdshowcapture will be used for video input instead of OpenCV", default=1)
@@ -133,7 +131,6 @@ if os.name == 'nt' and (args.list_cameras > 0 or args.list_dcaps is not None):
     sys.exit(0)
 
 import math
-import pickle
 import numpy as np
 import time
 import cv2
@@ -142,8 +139,6 @@ import struct
 import json
 from input_reader import InputReader, VideoReader, DShowCaptureReader, try_int
 from tracker import Tracker, get_model_base_path
-import pyvirtualcam
-from pyvirtualcam import PixelFormat
 
 if args.benchmark > 0:
     model_base_path = get_model_base_path(args.model_dir)
@@ -161,7 +156,7 @@ if args.benchmark > 0:
         print(1. / (total / 100.))
     sys.exit(0)
 
-max_length = 65535
+max_length = 65535-28 # 28 is for UDP header
 
 
 target_ip = args.ip
@@ -224,8 +219,6 @@ try:
     source_name = input_reader.name
     if args.hands == 1:
         holistic = mp_hands.Hands(model_complexity=1,min_detection_confidence=0.82,min_tracking_confidence=0.82)
-    if args.webcam_preview == 1:
-        cam =  pyvirtualcam.Camera(width, height, fps, fmt=PixelFormat.BGR, print_fps=fps)
         
     while repeat or input_reader.is_open(): 
         if not input_reader.is_open() or need_reinit == 1:
@@ -272,9 +265,6 @@ try:
             tracker = Tracker(width, height, threshold=args.threshold, max_threads=args.max_threads, max_faces=args.faces, discard_after=args.discard_after, scan_every=args.scan_every, silent=False if args.silent == 0 else True, model_type=args.model, model_dir=args.model_dir, no_gaze=False if args.gaze_tracking != 0 and args.model != -1 else True, detection_threshold=args.detection_threshold, use_retinaface=args.scan_retinaface, max_feature_updates=args.max_feature_updates, static_model=True if args.no_3d_adapt == 1 else False, try_hard=args.try_hard == 1)
             if args.video_out is not None:
                 out = cv2.VideoWriter(args.video_out, cv2.VideoWriter_fourcc('F','F','V','1'), args.video_fps, (width * args.video_scale, height * args.video_scale))
-        if args.webcam_preview == 1:
-            cam.send(frame)
-            cam.sleep_until_next_frame()
 
         try:
             inference_start = time.perf_counter()
@@ -428,8 +418,8 @@ try:
 
 
             if args.frame_data == 1:
-                # frame = frame if width < 720 else cv2.resize(frame, (720, 480), interpolation=cv2.INTER_NEAREST)
-                retval, buffer = cv2.imencode(".jpg", frame)
+                cam_frame = frame if width <= 480 else cv2.resize(frame, (480, math.ceil(height * (480 / width))), interpolation=cv2.INTER_NEAREST)
+                retval, buffer = cv2.imencode(".jpg", cam_frame)
                 if retval:
                     # convert to byte array
                     buffer = buffer.tobytes()
@@ -550,8 +540,6 @@ except KeyboardInterrupt:
         print("Quitting")
 if args.hands == 1 and holistic is not None:
     holistic.close()
-if args.webcam_preview == 1 and cam is not None:
-    cam.close()
 input_reader.close()
 if out is not None:
     out.release()
