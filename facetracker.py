@@ -32,7 +32,8 @@ parser.add_argument("-d", "--detection-threshold", type=float, help="Set minimum
 parser.add_argument("-v", "--visualize", type=int, help="Set this to 1 to visualize the tracking, to 2 to also show face ids, to 3 to add confidence values or to 4 to add numbers to the point display", default=0)
 parser.add_argument("-P", "--pnp-points", type=int, help="Set this to 1 to add the 3D fitting points to the visualization", default=0)
 parser.add_argument("-s", "--silent", type=int, help="Set this to 1 to prevent text output on the console", default=0)
-parser.add_argument("--hands", type=int, help="Set this to 1 to enable hands tracking, 0 to disable hands tracking", default=1)
+parser.add_argument("--hands", type=int, help="Set this to 1 to enable hands tracking, 0 to disable hands tracking", default=0)
+parser.add_argument("--fingers", type=int, help="Set this to 1 to enable finger tracking, 0 to disable finger tracking", default=0)
 parser.add_argument("--faces", type=int, help="Set the maximum number of faces (slow)", default=1)
 parser.add_argument("--scan-retinaface", type=int, help="When set to 1, scanning for additional faces will be performed using RetinaFace in a background thread, otherwise a simpler, faster face detection mechanism is used. When the maximum number of faces is 1, this option does nothing.", default=0)
 parser.add_argument("--scan-every", type=int, help="Set after how many frames a scan for new faces should run", default=3)
@@ -54,6 +55,10 @@ parser.add_argument("--repeat-video", type=int, help="When set to 1 and a video 
 parser.add_argument("--dump-points", type=str, help="When set to a filename, the current face 3D points are made symmetric and dumped to the given file when quitting the visualization with the \"q\" key", default="")
 parser.add_argument("--benchmark", type=int, help="When set to 1, the different tracking models are benchmarked, starting with the best and ending with the fastest and with gaze tracking disabled for models with negative IDs", default=0)
 parser.add_argument("--frame-data", type=int, help="When set to 1, the server is sending webcam frame data", default=0)
+parser.add_argument("--calibrate", type=int, help="When set to 1, calibration data will be written to calibrate-output", default=0)
+parser.add_argument("--calibration-path", help="Path to calibration data save file", default=None)
+
+
 
 if os.name == 'nt':
     parser.add_argument("--use-dshowcapture", type=int, help="When set to 1, libdshowcapture will be used for video input instead of OpenCV", default=1)
@@ -139,6 +144,15 @@ import struct
 import json
 from input_reader import InputReader, VideoReader, DShowCaptureReader, try_int
 from tracker import Tracker, get_model_base_path
+import pickle
+
+def saveCalibrationData():
+    if args.calibrate == 1 and args.calibration_path != None and len(tracker.face_info) > 0:
+        db = tracker.face_info[0].features
+        with open(args.calibration_path, 'ab') as dbfile: 
+            dbfile = open(args.calibration_path, 'ab')
+            # source, destination
+            pickle.dump(db, dbfile)  
 
 if args.benchmark > 0:
     model_base_path = get_model_base_path(args.model_dir)
@@ -262,9 +276,16 @@ try:
             first = False
             height, width, channels = frame.shape
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            tracker = Tracker(width, height, threshold=args.threshold, max_threads=args.max_threads, max_faces=args.faces, discard_after=args.discard_after, scan_every=args.scan_every, silent=False if args.silent == 0 else True, model_type=args.model, model_dir=args.model_dir, no_gaze=False if args.gaze_tracking != 0 and args.model != -1 else True, detection_threshold=args.detection_threshold, use_retinaface=args.scan_retinaface, max_feature_updates=args.max_feature_updates, static_model=True if args.no_3d_adapt == 1 else False, try_hard=args.try_hard == 1)
+            calibration = -1 if args.calibration_path != None else args.max_feature_updates
+            tracker = Tracker(width, height, threshold=args.threshold, max_threads=args.max_threads, max_faces=args.faces, discard_after=args.discard_after, scan_every=args.scan_every, silent=False if args.silent == 0 else True, model_type=args.model, model_dir=args.model_dir, no_gaze=False if args.gaze_tracking != 0 and args.model != -1 else True, detection_threshold=args.detection_threshold, use_retinaface=args.scan_retinaface, max_feature_updates=calibration, static_model=True if args.no_3d_adapt == 1 else False, try_hard=args.try_hard == 1)
             if args.video_out is not None:
                 out = cv2.VideoWriter(args.video_out, cv2.VideoWriter_fourcc('F','F','V','1'), args.video_fps, (width * args.video_scale, height * args.video_scale))
+            if args.calibrate != 1 and args.calibration_path != None and os.path.isfile(args.calibration_path): #only load values if not in recording mode
+                with open(args.calibration_path, 'rb') as dbfile: 
+                    db = pickle.load(dbfile)
+                    tracker.face_info[0].features = db
+                    tracker.first_seen = -1
+                    tracker.updating = False
 
         try:
             inference_start = time.perf_counter()
@@ -329,10 +350,11 @@ try:
                         if args.visualize > 3:
                             frame = cv2.putText(frame, str(pt_num), (int(y), int(x)), cv2.FONT_HERSHEY_SIMPLEX, 0.25, (255,255,0))
                         color = (0, 255, 0)
+                        dot_size = int(width/500)
                         if pt_num >= 66:
                             color = (255, 255, 0)
                         if not (x < 0 or y < 0 or x >= height or y >= width):
-                            cv2.circle(frame, (y, x), 1, color, -1)
+                            cv2.circle(frame, (y, x), dot_size, color, -1)
                 if args.pnp_points != 0 and (args.visualize != 0 or out is not None) and f.rotation is not None:
                     if args.pnp_points > 1:
                         projected = cv2.projectPoints(f.face_3d[0:66], f.rotation, f.translation, tracker.camera, tracker.dist_coeffs)
@@ -370,6 +392,8 @@ try:
                     log.write("\r\n")
                     log.flush()
 
+            handDetected = False
+
             # -- DETECT HANDS -----------------------------
             if args.hands == 1:
                 frame.flags.writeable = False
@@ -383,36 +407,51 @@ try:
                 
                 # hands_count = 0 if not results.multi_handedness else len(results.multi_handedness)
                 # packet.extend(bytearray(struct.pack("i", hands_count)))
-                handposition = [[[0] * 3 for i in range(4)] for i in range(2)] # 4 vector3 for 2 hands
+                if args.fingers == 1:
+                    handposition = [[[0] * 3 for i in range(25)] for i in range(2)] # 4+21 vector3 for 2 hands
+                else:
+                    handposition = [[[0] * 3 for i in range(4)] for i in range(2)] # 4 vector3 for 2 hands
+                    
                 if results.multi_handedness:                    
                     for i, handedness in enumerate(results.multi_handedness):
                         hand_landmarks = results.multi_hand_landmarks[i]
-                        # hand_world_landmarks = results.multi_hand_world_landmarks[i]
                         jointIndices = [0,1,5,9]
                         poses = [hand_landmarks.landmark[i] for i in jointIndices] # wrist, index, middle joints 
-                        # world_poses = [hand_world_landmarks.landmark[i] for i in jointIndices] # wrist, index, middle joints 
-
-                        hand_info = handedness.classification[0]
-                        hand_index = hand_info.index
-
-                        for jointIndex, pose in enumerate(poses):
-                            handposition[hand_index][jointIndex][0] = float(pose.x)                    
-                            handposition[hand_index][jointIndex][1] = float(pose.y)                
-                            handposition[hand_index][jointIndex][2] = float(pose.z)              
-
+                        
+                        # draw a circle on a hand
                         wrist = poses[0]
                         middle = poses[3]
                         x = (middle.x + wrist.x)/2 * width
                         y = (middle.y + wrist.y)/2.2 * height
                         frame = cv2.circle(frame,(int(x), int(y)), int(width/50), (0,255,0), 2)
+                        
+                        if middle != wrist:
+                            handDetected = True
+                        
+                        # Add fingers world coordinate info if needed
+                        if args.fingers == 1:
+                            poses = [*poses, *results.multi_hand_world_landmarks[i].landmark]
+                        
+                        hand_info  = handedness.classification[0]
+                        hand_index = hand_info.index
 
-                for hand in handposition:
-                    for joint in hand:
-                        for axis in joint:
-                            packet.extend(bytearray(struct.pack("f", axis)))
+                        for jointIndex, pose in enumerate(poses):
+                            handposition[hand_index][jointIndex][0] = float(pose.x)                    
+                            handposition[hand_index][jointIndex][1] = float(pose.y)                
+                            handposition[hand_index][jointIndex][2] = float(pose.z)
+                
+                
+                if handDetected:
+                    if not detected:
+                        packet.extend(bytearray(struct.pack("d", now)))
+                        packet.extend(bytearray(struct.pack("i", -1)))
+                    for hand in handposition:
+                        for joint in hand:
+                            for axis in joint:
+                                packet.extend(bytearray(struct.pack("f", axis)))
 
-            if detected and len(faces) < 40:
-                sock.sendto(packet, (target_ip, target_port))
+            if (detected and len(faces) < 40) or handDetected:
+                sock.sendto(packet, (target_ip, target_port))         
             else:
                 sock.sendto(struct.pack("B", 0), (target_ip, target_port))
 
@@ -523,6 +562,9 @@ try:
 
         collected = False
         del frame
+        
+        if args.calibrate == 1 and frame_count % 10:
+            saveCalibrationData()
 
         duration = time.perf_counter() - frame_time
         while duration < target_duration:
@@ -538,6 +580,7 @@ try:
 except KeyboardInterrupt:
     if args.silent == 0:
         print("Quitting")
+        
 if args.hands == 1 and holistic is not None:
     holistic.close()
 input_reader.close()
