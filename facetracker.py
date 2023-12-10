@@ -146,14 +146,6 @@ from input_reader import InputReader, VideoReader, DShowCaptureReader, try_int
 from tracker import Tracker, get_model_base_path
 import pickle
 
-def saveCalibrationData():
-    if args.calibrate == 1 and args.calibration_path != None and len(tracker.face_info) > 0:
-        db = tracker.face_info[0].features
-        with open(args.calibration_path, 'ab') as dbfile: 
-            dbfile = open(args.calibration_path, 'ab')
-            # source, destination
-            pickle.dump(db, dbfile)  
-
 if args.benchmark > 0:
     model_base_path = get_model_base_path(args.model_dir)
     im = cv2.imread(os.path.join(model_base_path, "benchmark.bin"), cv2.IMREAD_COLOR)
@@ -221,6 +213,8 @@ if args.log_data != "":
 
 is_camera = args.capture == str(try_int(args.capture))
 
+calibration_time = time.perf_counter()
+
 try:
     attempt = 0
     frame_time = time.perf_counter()
@@ -276,16 +270,18 @@ try:
             first = False
             height, width, channels = frame.shape
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            calibration = -1 if args.calibration_path != None else args.max_feature_updates
+            calibration = -1 if (args.calibration_path != None and args.calibrate != 1) else args.max_feature_updates
             tracker = Tracker(width, height, threshold=args.threshold, max_threads=args.max_threads, max_faces=args.faces, discard_after=args.discard_after, scan_every=args.scan_every, silent=False if args.silent == 0 else True, model_type=args.model, model_dir=args.model_dir, no_gaze=False if args.gaze_tracking != 0 and args.model != -1 else True, detection_threshold=args.detection_threshold, use_retinaface=args.scan_retinaface, max_feature_updates=calibration, static_model=True if args.no_3d_adapt == 1 else False, try_hard=args.try_hard == 1)
             if args.video_out is not None:
                 out = cv2.VideoWriter(args.video_out, cv2.VideoWriter_fourcc('F','F','V','1'), args.video_fps, (width * args.video_scale, height * args.video_scale))
-            if args.calibrate != 1 and args.calibration_path != None and os.path.isfile(args.calibration_path): #only load values if not in recording mode
-                with open(args.calibration_path, 'rb') as dbfile: 
-                    db = pickle.load(dbfile)
-                    tracker.face_info[0].features = db
-                    tracker.first_seen = -1
-                    tracker.updating = False
+            if args.calibrate != 1 and args.calibration_path != None: #only load values if not in recording mode
+                try:
+                    with open(args.calibration_path, 'rb') as dbfile: 
+                        db = pickle.load(dbfile)
+                        tracker.face_info[0].features = db
+                except Exception as e:
+                    os.remove(args.calibration_path)
+                    break
 
         try:
             inference_start = time.perf_counter()
@@ -455,6 +451,14 @@ try:
             else:
                 sock.sendto(struct.pack("B", 0), (target_ip, target_port))
 
+            if detected and args.calibrate == 1 and args.calibration_path != None and now - calibration_time > 1.35:
+                if len(tracker.face_info) > 0:
+                    calibration_time = now
+                    db = copy.deepcopy(tracker.face_info[0].features)
+                    db.clear_median()
+                    with open(args.calibration_path, 'wb') as dbfile:
+                        # source, destination
+                        pickle.dump(db, dbfile)
 
             if args.frame_data == 1:
                 cam_frame = frame if width <= 480 else cv2.resize(frame, (480, math.ceil(height * (480 / width))), interpolation=cv2.INTER_NEAREST)
@@ -562,9 +566,6 @@ try:
 
         collected = False
         del frame
-        
-        if args.calibrate == 1 and frame_count % 10:
-            saveCalibrationData()
 
         duration = time.perf_counter() - frame_time
         while duration < target_duration:

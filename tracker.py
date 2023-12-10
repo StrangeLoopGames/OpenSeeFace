@@ -164,7 +164,11 @@ class Feature():
         self.max_feature_updates = max_feature_updates
         self.first_seen = -1
         self.updating = True
-
+        
+    def clear_update(self):
+        self.updating = False
+        self.median = None
+        
     def update(self, x, now=0):
         if self.max_feature_updates > 0:
             if self.first_seen == -1:
@@ -239,6 +243,22 @@ class FeatureExtractor():
         self.mouth_corner_inout_r = Feature(threshold=0.02, max_feature_updates=max_feature_updates)
         self.mouth_open = Feature(max_feature_updates=max_feature_updates)
         self.mouth_wide = Feature(threshold=0.02, max_feature_updates=max_feature_updates)
+        
+    def clear_median(self):
+        self.eye_l.clear_update()
+        self.eye_r.clear_update()
+        self.eyebrow_updown_l.clear_update()
+        self.eyebrow_updown_r.clear_update()
+        self.eyebrow_quirk_l.clear_update()
+        self.eyebrow_quirk_r.clear_update()
+        self.eyebrow_steepness_l.clear_update()
+        self.eyebrow_steepness_r.clear_update()
+        self.mouth_corner_updown_l.clear_update()
+        self.mouth_corner_updown_r.clear_update()
+        self.mouth_corner_inout_l.clear_update()
+        self.mouth_corner_inout_r.clear_update()
+        self.mouth_open.clear_update()
+        self.mouth_wide.clear_update()
 
     def align_points(self, a, b, pts):
         a = tuple(a)
@@ -342,7 +362,7 @@ class FaceInfo():
         self.update_count_delta = 75.
         self.update_count_max = 7500.
 
-        if self.tracker.max_feature_updates > 0:
+        if self.tracker.max_feature_updates != 0:
             self.features = FeatureExtractor(self.tracker.max_feature_updates)
 
     def reset(self):
@@ -360,7 +380,7 @@ class FaceInfo():
         self.eye_blink = None
         self.bbox = None
         self.pnp_error = 0
-        if self.tracker.max_feature_updates < 1:
+        if self.tracker.max_feature_updates == 0:
             self.features = FeatureExtractor(0)
         self.current_features = {}
         self.contour = np.zeros((21,3))
